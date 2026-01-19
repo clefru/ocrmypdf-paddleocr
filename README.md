@@ -199,14 +199,14 @@ PaddleOCR processes each page image and returns bounding boxes with recognized t
 
 This plugin includes optimized bounding box calculation for accurate text selection in the output PDF:
 
-### Improved Word-Level Boxes
+### Native Word-Level Boxes (PaddleOCR 3.x)
 
-PaddleOCR provides line-level text detection only. The plugin estimates word-level bounding boxes by:
-- Properly allocating horizontal space proportionally to character count
-- Accounting for inter-word spacing to eliminate gaps at line ends
-- Ensuring the last word extends to the full line width
+The plugin uses PaddleOCR 3.x's native `return_word_box=True` parameter to get accurate word-level bounding boxes directly from the OCR engine:
+- Native word boxes provide precise boundaries for each word
+- Automatic merging of split tokens (handles German umlauts, punctuation, etc.)
+- Falls back to estimation algorithm when word boxes aren't available (e.g., blank pages)
 
-**Result**: Word bounding boxes now accurately cover the entire line with zero gap at the end.
+**Result**: Word bounding boxes are now pixel-accurate, matching exactly what PaddleOCR detected.
 
 ### Polygon-Based Vertical Bounds
 

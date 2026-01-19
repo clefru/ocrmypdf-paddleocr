@@ -4,12 +4,61 @@ This document describes the bounding box improvements implemented in the PaddleO
 
 ## Overview
 
-Two critical issues with text bounding boxes in the hOCR output were identified and fixed:
+Three major improvements to text bounding boxes in the hOCR output:
 
-1. **Horizontal Issue**: Word bounding boxes were too short, leaving ~150px gaps at line ends
-2. **Vertical Issue**: Line bounding boxes included unnecessary padding from min/max calculation
+1. **Native Word Boxes**: Use PaddleOCR 3.x's `return_word_box=True` for accurate word-level detection
+2. **Horizontal Fallback**: Improved word width estimation when native boxes unavailable
+3. **Vertical Issue**: Tighter line bounding boxes using polygon edge averaging
 
-## Fix 1: Word Width Calculation (Horizontal)
+## Fix 1: Native Word-Level Bounding Boxes
+
+### Implementation
+
+PaddleOCR 3.x supports native word-level bounding boxes via the `return_word_box=True` parameter. The plugin now uses this feature:
+
+```python
+result = paddle_ocr.predict(str(input_file), return_word_box=True)
+
+# Extract word-level data
+text_words = ocr_result.get('text_word', [])
+text_word_regions = ocr_result.get('text_word_region', [])
+```
+
+### Token Merging
+
+PaddleOCR may split words unexpectedly (German umlauts, punctuation, emails). The plugin merges adjacent non-whitespace tokens:
+
+```python
+# Merge tokens that were split unexpectedly
+merged_words = []
+current_word = []
+current_boxes = []
+
+for token, box in zip(line_word_tokens, line_word_boxes):
+    token_str = str(token).strip()
+    if not token_str or token_str.isspace():
+        # Whitespace token - finalize current word
+        if current_word:
+            merged_words.append((''.join(current_word), current_boxes))
+            current_word = []
+            current_boxes = []
+    else:
+        # Non-whitespace token - accumulate
+        current_word.append(token_str)
+        current_boxes.append(box)
+```
+
+The bounding box for merged words is computed as the union of all sub-token boxes, using the polygon-edge method for vertical bounds.
+
+**Location**: `src/ocrmypdf_paddleocr/plugin.py:319-404`
+
+### Results
+
+- Pixel-accurate word boundaries from PaddleOCR's detection
+- Proper handling of split tokens (umlauts, punctuation)
+- Automatic fallback to estimation when word boxes unavailable
+
+## Fix 2: Word Width Calculation (Fallback)
 
 ### Problem
 
@@ -55,7 +104,7 @@ if i == len(words) - 1:
 - Zero gap at line ends
 - Proper proportional allocation for both words and spaces
 
-## Fix 2: Vertical Bounds Using Polygon Edges
+## Fix 3: Vertical Bounds Using Polygon Edges
 
 ### Problem
 
@@ -165,31 +214,39 @@ The polygon may have slight rotation/skew, which is why averaging the edges give
 - Y increases downward
 - All coordinates are scaled from PaddleOCR's resized image back to original resolution
 
-### Word-Level Estimation
+### Word-Level Detection
 
-PaddleOCR provides line-level detection only. Word boxes are estimated by:
+The plugin uses PaddleOCR 3.x's native `return_word_box=True` parameter for accurate word-level bounding boxes. When native word boxes are available:
+1. Extract `text_word` and `text_word_region` from OCR results
+2. Merge split tokens (handles umlauts, punctuation)
+3. Compute union bounding box using polygon-edge vertical bounds
+
+When native word boxes are unavailable (blank pages, older PaddleOCR versions), the plugin falls back to estimation:
 1. Splitting text on whitespace
 2. Allocating horizontal space proportionally by character count
 3. Using the same vertical bounds for all words in a line
 
-Note: PaddleOCR 3.2.0+ has a `return_word_box` parameter for native word-level boxes, but it's not available in the 3.1.1 version used here.
-
 ## Files Modified
 
-- `src/ocrmypdf_paddleocr/plugin.py` - Lines 277-343
-  - Vertical bounds: lines 277-301
-  - Horizontal bounds (word estimation): lines 306-343
+- `src/ocrmypdf_paddleocr/plugin.py` - Lines 207, 267-272, 319-460
+  - Native word boxes: lines 319-404
+  - Fallback word estimation: lines 405-453
+  - Vertical bounds (polygon edges): lines 284-296, 371-376
+- `shell.nix` - Lines 57-61
+  - Added paddlex-with-ocr and paddleocr-with-ocr to environment
+  - Added missing OCR dependencies (python-bidi, sentencepiece)
 
 ## Related Issues
 
-- Word bounding boxes were too short (fixed)
+- Word bounding boxes were too short (fixed with native boxes)
 - Line bounding boxes had excess vertical padding (improved by 3-6%)
+- PaddleX OCR dependencies missing in Nix environment (fixed)
 
 ## Future Improvements
 
-1. **Upgrade to PaddleOCR 3.2.0+**: Use native `return_word_box` parameter for accurate word-level detection
-2. **Character-level boxes**: PaddleOCR can provide character-level boxes for even more precise selection
-3. **Baseline detection**: Use PaddleOCR's text direction/angle detection to handle rotated text better
+1. **Character-level boxes**: PaddleOCR can provide character-level boxes for even more precise selection
+2. **Baseline detection**: Use PaddleOCR's text direction/angle detection to handle rotated text better
+3. **Per-word confidence scores**: Extract individual word confidence from PaddleOCR when available
 
 ## References
 

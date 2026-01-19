@@ -203,7 +203,8 @@ class PaddleOCREngine(OcrEngine):
             log.debug(f"Input image: {width}x{height}, DPI: {dpi}")
 
         # Run OCR - use predict() instead of deprecated ocr()
-        result = paddle_ocr.predict(str(input_file))
+        # Enable return_word_box=True for native word-level bounding boxes
+        result = paddle_ocr.predict(str(input_file), return_word_box=True)
 
         # Calculate scaling factors from preprocessed image
         scale_x = 1.0
@@ -258,11 +259,17 @@ class PaddleOCREngine(OcrEngine):
             ocr_result = result[0]  # Get first page result
 
             # OCRResult is a dict-like object with keys: rec_texts, rec_scores, rec_polys
+            # With return_word_box=True, also: text_word, text_word_region
             texts = ocr_result.get('rec_texts', [])
             scores = ocr_result.get('rec_scores', [])
             polys = ocr_result.get('rec_polys', [])
 
-            log.debug(f"PaddleOCR found {len(texts)} text regions")
+            # Word-level data (from return_word_box=True)
+            text_words = ocr_result.get('text_word', [])
+            text_word_regions = ocr_result.get('text_word_region', [])
+
+            has_word_boxes = bool(text_words and text_word_regions)
+            log.debug(f"PaddleOCR found {len(texts)} text regions, word boxes: {has_word_boxes}")
 
             word_id = 1
             carea_id = 1
@@ -316,33 +323,75 @@ class PaddleOCREngine(OcrEngine):
                     f'title="bbox {x_min} {y_min} {x_max} {y_max}; baseline 0 0; x_wconf {conf_pct}">'
                 )
 
-                # Split text into words and estimate bounding boxes
-                # PaddleOCR doesn't provide word-level bboxes, so we estimate them
-                words = text.split()
-                if words:
-                    line_width = x_max - x_min
-                    # Calculate width available for words (excluding spaces)
-                    total_chars = sum(len(w) for w in words)
-                    num_spaces = len(words) - 1
-                    # Allocate space for inter-word spaces
-                    total_space_width = line_width - total_chars * (line_width / (total_chars + num_spaces))
-                    space_width = int(total_space_width / num_spaces) if num_spaces > 0 else 0
-                    # Width available for actual word characters
-                    word_area_width = line_width - (space_width * num_spaces)
+                # Process word-level bounding boxes
+                # Use native word boxes from PaddleOCR when available
+                line_idx = line_id - 1  # 0-indexed for accessing word data
 
-                    current_x = x_min
-                    for i, word in enumerate(words):
-                        # Estimate word width based on character proportion
-                        if total_chars > 0:
-                            word_width = int(word_area_width * len(word) / total_chars)
-                        else:
-                            word_width = line_width // len(words)
+                if (has_word_boxes and
+                    line_idx < len(text_words) and
+                    line_idx < len(text_word_regions) and
+                    text_words[line_idx] and
+                    text_word_regions[line_idx]):
+                    # Use native word boxes from PaddleOCR
+                    line_word_tokens = text_words[line_idx]
+                    line_word_boxes = text_word_regions[line_idx]
 
-                        # For the last word, extend to line end to avoid rounding errors
-                        if i == len(words) - 1:
-                            word_x_max = x_max
+                    # Merge tokens that were split unexpectedly (punctuation, umlauts)
+                    # Group non-whitespace tokens and compute union of their boxes
+                    merged_words = []
+                    current_word = []
+                    current_boxes = []
+
+                    for token, box in zip(line_word_tokens, line_word_boxes):
+                        token_str = str(token).strip()
+                        if not token_str or token_str.isspace():
+                            # Whitespace token - finalize current word
+                            if current_word:
+                                merged_words.append((''.join(current_word), current_boxes))
+                                current_word = []
+                                current_boxes = []
                         else:
-                            word_x_max = current_x + word_width
+                            # Non-whitespace token - accumulate
+                            current_word.append(token_str)
+                            current_boxes.append(box)
+
+                    # Don't forget last word
+                    if current_word:
+                        merged_words.append((''.join(current_word), current_boxes))
+
+                    # Output merged words with their bounding boxes
+                    for i, (word, boxes) in enumerate(merged_words):
+                        if not word:
+                            continue
+
+                        # Compute union box of all sub-token boxes
+                        import numpy as np
+                        all_xs = []
+                        all_ys_top = []
+                        all_ys_bottom = []
+
+                        for box in boxes:
+                            if isinstance(box, np.ndarray):
+                                box_scaled = box * [scale_x, scale_y]
+                                all_xs.extend(box_scaled[:, 0])
+                                # Use polygon edge method for vertical bounds
+                                if len(box_scaled) == 4:
+                                    all_ys_top.append((box_scaled[0][1] + box_scaled[1][1]) / 2)
+                                    all_ys_bottom.append((box_scaled[2][1] + box_scaled[3][1]) / 2)
+                                else:
+                                    all_ys_top.append(box_scaled[:, 1].min())
+                                    all_ys_bottom.append(box_scaled[:, 1].max())
+                            else:
+                                # Fallback for non-numpy boxes
+                                for point in box:
+                                    all_xs.append(point[0] * scale_x)
+                                    all_ys_top.append(point[1] * scale_y)
+                                    all_ys_bottom.append(point[1] * scale_y)
+
+                        word_x_min = int(min(all_xs))
+                        word_x_max = int(max(all_xs))
+                        word_y_min = int(min(all_ys_top))
+                        word_y_max = int(max(all_ys_bottom))
 
                         # Escape HTML entities in word
                         word_escaped = (word.replace('&', '&amp;')
@@ -351,16 +400,64 @@ class PaddleOCREngine(OcrEngine):
 
                         hocr_lines.append(
                             f'<span class="ocrx_word" id="word_{word_id}" '
-                            f'title="bbox {current_x} {y_min} {word_x_max} {y_max}; '
+                            f'title="bbox {word_x_min} {word_y_min} {word_x_max} {word_y_max}; '
                             f'x_wconf {conf_pct}">{word_escaped}</span>'
                         )
 
                         # Add space after word (except for last word)
-                        if i < len(words) - 1:
+                        if i < len(merged_words) - 1:
                             hocr_lines.append(' ')
 
-                        current_x = word_x_max + space_width
                         word_id += 1
+                else:
+                    # Fallback: estimate word boxes from line box
+                    # Split text into words and estimate bounding boxes
+                    words = text.split()
+                    if words:
+                        line_width = x_max - x_min
+                        # Calculate width available for words (excluding spaces)
+                        total_chars = sum(len(w) for w in words)
+                        num_spaces = len(words) - 1
+                        # Allocate space for inter-word spaces
+                        if total_chars + num_spaces > 0:
+                            total_space_width = line_width - total_chars * (line_width / (total_chars + num_spaces))
+                            space_width = int(total_space_width / num_spaces) if num_spaces > 0 else 0
+                        else:
+                            space_width = 0
+                        # Width available for actual word characters
+                        word_area_width = line_width - (space_width * num_spaces)
+
+                        current_x = x_min
+                        for i, word in enumerate(words):
+                            # Estimate word width based on character proportion
+                            if total_chars > 0:
+                                word_width = int(word_area_width * len(word) / total_chars)
+                            else:
+                                word_width = line_width // len(words)
+
+                            # For the last word, extend to line end to avoid rounding errors
+                            if i == len(words) - 1:
+                                word_x_max = x_max
+                            else:
+                                word_x_max = current_x + word_width
+
+                            # Escape HTML entities in word
+                            word_escaped = (word.replace('&', '&amp;')
+                                               .replace('<', '&lt;')
+                                               .replace('>', '&gt;'))
+
+                            hocr_lines.append(
+                                f'<span class="ocrx_word" id="word_{word_id}" '
+                                f'title="bbox {current_x} {y_min} {word_x_max} {y_max}; '
+                                f'x_wconf {conf_pct}">{word_escaped}</span>'
+                            )
+
+                            # Add space after word (except for last word)
+                            if i < len(words) - 1:
+                                hocr_lines.append(' ')
+
+                            current_x = word_x_max + space_width
+                            word_id += 1
 
                 # Close the line span
                 hocr_lines.append('</span>')

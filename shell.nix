@@ -53,6 +53,12 @@ pkgs.mkShell {
     # Python with the plugin and all dependencies
     (python.withPackages (ps: [
       ocrmypdf-paddleocr
+      # Explicitly include the overridden packages with OCR dependencies
+      paddlex-with-ocr
+      paddleocr-with-ocr
+      # Missing PaddleX OCR dependencies not in nixpkgs paddlex optional-dependencies
+      ps.python-bidi
+      ps.sentencepiece
       # Development tools
       ps.pytest
       ps.ipython
