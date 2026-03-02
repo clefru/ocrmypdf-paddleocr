@@ -34,9 +34,16 @@ setup(
     install_requires=[
         "ocrmypdf>=14.0.0",
         "paddlepaddle>=2.5.0",
-        "paddleocr>=2.7.0",
+        "paddlex==3.3.*",
+        "paddleocr==3.3.*",
         "pillow>=9.0.0",
     ],
+    extras_require={
+        # PaddleOCR-VL-1.5 (0.9B VLM) support - requires additional doc-parser deps
+        "vl": [
+            "paddleocr[doc-parser]>=3.3.0",
+        ],
+    },
     entry_points={
         "ocrmypdf": [
             "paddleocr = ocrmypdf_paddleocr.plugin:get_plugin",

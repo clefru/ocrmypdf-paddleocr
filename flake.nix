@@ -11,6 +11,15 @@
       pkgs = import nixpkgs {
         inherit system;
         config.allowUnfree = true;
+        overlays = [(final: prev: {
+          python312 = prev.python312.override {
+            packageOverrides = _pyfinal: pyprev: {
+              # behave 1.3.3 has a flaky test failure in nixpkgs master; disable checks
+              # (behave is only a test dep of python-docx, which is pulled in by pdf2docx/paddlex)
+              behave = pyprev.behave.overridePythonAttrs (_: { doCheck = false; });
+            };
+          };
+        })];
       };
 
       python = pkgs.python312;
@@ -36,15 +45,33 @@
         # opencv-contrib-python and premailer handled by shims
       ];
 
+      # Override paddlepaddle to skip strict wheel METADATA version checks.
+      # The wheel pins opt-einsum==3.3.0 but nixpkgs ships 3.4.0 (compatible);
+      # networkx is only used for paddle graph features, not OCR.
+      paddlepaddle-relaxed = pythonPackages.paddlepaddle.overridePythonAttrs (old: {
+        # dontCheckRuntimeDeps is read by pythonRuntimeDepsCheckHook as a shell var
+        env.dontCheckRuntimeDeps = "1";
+        # Fix numpy 2.x incompatibility: int(np.array(multi_element)) raises TypeError
+        # in numpy 2.x when the array has >0 dimensions. Use .item() for scalar extraction.
+        # Affects paddle/base/dygraph/math_op_patch.py __int__ / __index__ methods.
+        postInstall = (old.postInstall or "") + ''
+          substituteInPlace "$out/${python.sitePackages}/paddle/base/dygraph/math_op_patch.py" \
+            --replace \
+              'return int(np.array(var))' \
+              'arr = np.array(var); return int(arr.item() if arr.ndim > 0 else arr)'
+        '';
+      });
+
       # Override paddlex to include OCR dependencies
       paddlex-with-ocr = pythonPackages.paddlex.overridePythonAttrs (old: {
         dependencies = (old.dependencies or []) ++ paddlex-ocr-deps;
       });
 
-      # Override paddleocr to use paddlex-with-ocr
-      paddleocr-with-ocr = pythonPackages.paddleocr.override {
+      # Override paddleocr to use paddlex-with-ocr and paddlepaddle-relaxed
+      paddleocr-with-ocr = (pythonPackages.paddleocr.override {
         paddlex = paddlex-with-ocr;
-      };
+        paddlepaddle = paddlepaddle-relaxed;
+      });
 
       # PaddleX compatibility shims (opencv-contrib-python and premailer)
       python-shims = pkgs.runCommand "paddlex-compat-shims" {} ''
@@ -114,7 +141,7 @@ EOF
           (ocrmypdf.override {
             img2pdf = img2pdf.overridePythonAttrs (old: { doCheck = false; });
           })
-          paddlepaddle
+          paddlepaddle-relaxed
           paddleocr-with-ocr
           pillow
         ];

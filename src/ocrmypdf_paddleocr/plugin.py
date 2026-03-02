@@ -15,6 +15,11 @@ try:
 except ImportError:
     PaddleOCR = None
 
+try:
+    from paddleocr import PaddleOCRVL
+except ImportError:
+    PaddleOCRVL = None
+
 log = logging.getLogger(__name__)
 
 
@@ -24,6 +29,16 @@ def add_options(parser):
     paddle = parser.add_argument_group(
         "PaddleOCR",
         "Options for PaddleOCR engine"
+    )
+    paddle.add_argument(
+        '--paddle-engine',
+        choices=['classic', 'vl'],
+        default='classic',
+        dest='paddle_engine',
+        help=(
+            'OCR engine variant: "classic" (default, fast CNN-based pipeline) or '
+            '"vl" (PaddleOCR-VL-1.5, a 0.9B VLM with superior accuracy but slower)'
+        ),
     )
     paddle.add_argument(
         '--paddle-use-gpu',
@@ -62,12 +77,91 @@ def add_options(parser):
 @hookimpl
 def check_options(options):
     """Validate PaddleOCR options."""
-    if PaddleOCR is None:
-        from ocrmypdf.exceptions import MissingDependencyError
-        raise MissingDependencyError(
-            "PaddleOCR is not installed. "
-            "Install it with: pip install paddlepaddle paddleocr"
-        )
+    engine = getattr(options, 'paddle_engine', 'classic')
+    if engine == 'vl':
+        if PaddleOCRVL is None:
+            from ocrmypdf.exceptions import MissingDependencyError
+            raise MissingDependencyError(
+                "PaddleOCRVL is not available. "
+                "Install it with: pip install 'paddleocr[doc-parser]'"
+            )
+    else:
+        if PaddleOCR is None:
+            from ocrmypdf.exceptions import MissingDependencyError
+            raise MissingDependencyError(
+                "PaddleOCR is not installed. "
+                "Install it with: pip install paddlepaddle paddleocr"
+            )
+
+
+def _poly_to_bbox(poly):
+    """Convert a 4-point polygon (TL,TR,BR,BL tuples) to a tight bbox.
+
+    Uses polygon-edge averaging for vertical bounds (tighter than min/max).
+    """
+    xs = [p[0] for p in poly]
+    x_min = int(min(xs))
+    x_max = int(max(xs))
+    # Average top edge (TL+TR) and bottom edge (BR+BL) for tighter vertical fit
+    if len(poly) == 4:
+        y_min = int((poly[0][1] + poly[1][1]) / 2)
+        y_max = int((poly[2][1] + poly[3][1]) / 2)
+    else:
+        ys = [p[1] for p in poly]
+        y_min = int(min(ys))
+        y_max = int(max(ys))
+    return x_min, y_min, x_max, y_max
+
+
+def _group_words_into_lines(word_boxes):
+    """Group word polygons into text lines by vertical proximity.
+
+    Args:
+        word_boxes: list of (text, poly) where poly is a list of 4 (x,y) tuples
+                    in TL, TR, BR, BL order.
+
+    Returns:
+        list of lines, each line is a list of (text, poly) sorted left-to-right.
+    """
+    if not word_boxes:
+        return []
+
+    def poly_y_center(poly):
+        return sum(p[1] for p in poly) / len(poly)
+
+    def poly_height(poly):
+        y_top = (poly[0][1] + poly[1][1]) / 2   # average of TL, TR
+        y_bot = (poly[2][1] + poly[3][1]) / 2   # average of BR, BL
+        return abs(y_bot - y_top)
+
+    # Sort words by Y-center for top-to-bottom processing
+    sorted_words = sorted(word_boxes, key=lambda wb: poly_y_center(wb[1]))
+
+    # Estimate grouping threshold from median word height
+    heights = sorted([poly_height(wb[1]) for wb in sorted_words])
+    median_height = heights[len(heights) // 2] if heights else 20
+    threshold = median_height * 0.6
+
+    lines = []
+    current_line = [sorted_words[0]]
+    current_y = poly_y_center(sorted_words[0][1])
+
+    for word, poly in sorted_words[1:]:
+        y_center = poly_y_center(poly)
+        if abs(y_center - current_y) <= threshold:
+            current_line.append((word, poly))
+        else:
+            lines.append(current_line)
+            current_line = [(word, poly)]
+            current_y = y_center
+
+    lines.append(current_line)
+
+    # Sort each line left-to-right by x_min of its polygon
+    for i, line in enumerate(lines):
+        lines[i] = sorted(line, key=lambda wb: min(p[0] for p in wb[1]))
+
+    return lines
 
 
 class PaddleOCREngine(OcrEngine):
@@ -105,6 +199,9 @@ class PaddleOCREngine(OcrEngine):
     @staticmethod
     def creator_tag(options):
         """Return the creator tag to identify this software."""
+        engine = getattr(options, 'paddle_engine', 'classic')
+        if engine == 'vl':
+            return f"PaddleOCR-VL-1.5 {PaddleOCREngine.version()}"
         return f"PaddleOCR {PaddleOCREngine.version()}"
 
     def __str__(self):
@@ -176,6 +273,39 @@ class PaddleOCREngine(OcrEngine):
         return PaddleOCR(**kwargs)
 
     @staticmethod
+    def _get_paddle_vl(options):
+        """Create and configure PaddleOCRVL instance.
+
+        Supports both paddleocr 3.3.x (PaddleOCR-VL v1) and newer versions
+        that expose pipeline_version='v1.5' with native spotting mode.
+        """
+        import inspect
+        sig = inspect.signature(PaddleOCRVL.__init__)
+
+        kwargs = {
+            # OCRmyPDF handles page rotation and unwarping upstream
+            'use_doc_orientation_classify': False,
+            'use_doc_unwarping': False,
+            # Disable layout detection: treat the whole page as one block
+            'use_layout_detection': False,
+        }
+
+        # pipeline_version only available in paddleocr >= 3.4.x
+        if 'pipeline_version' in sig.parameters:
+            kwargs['pipeline_version'] = 'v1.5'
+            log.debug("PaddleOCRVL: using pipeline_version=v1.5 (spotting mode)")
+        else:
+            log.debug("PaddleOCRVL: pipeline_version not available, using v1 (ocr mode)")
+
+        if getattr(options, 'paddle_use_gpu', False):
+            kwargs['device'] = 'gpu'
+        else:
+            kwargs['device'] = 'cpu'
+
+        log.debug(f"Creating PaddleOCRVL with kwargs: {kwargs}")
+        return PaddleOCRVL(**kwargs)
+
+    @staticmethod
     def get_orientation(input_file: Path, options) -> OrientationConfidence:
         """Get page orientation."""
         # PaddleOCR handles orientation internally if use_angle_cls=True
@@ -191,6 +321,235 @@ class PaddleOCREngine(OcrEngine):
     @staticmethod
     def generate_hocr(input_file: Path, output_hocr: Path, output_text: Path, options):
         """Generate hOCR output for an image."""
+        engine = getattr(options, 'paddle_engine', 'classic')
+        if engine == 'vl':
+            PaddleOCREngine._generate_hocr_vl(input_file, output_hocr, output_text, options)
+        else:
+            PaddleOCREngine._generate_hocr_classic(input_file, output_hocr, output_text, options)
+
+    @staticmethod
+    def _generate_hocr_vl(input_file: Path, output_hocr: Path, output_text: Path, options):
+        """Generate hOCR using PaddleOCR-VL in full-page mode.
+
+        Uses spotting mode (native word boxes) when available (paddleocr >= 3.4.x,
+        pipeline_version='v1.5'), otherwise falls back to OCR mode which returns
+        text blocks whose word positions are estimated proportionally.
+        """
+        log.debug(f"Running PaddleOCR-VL on {input_file}")
+
+        vl_pipeline = PaddleOCREngine._get_paddle_vl(options)
+
+        with Image.open(input_file) as img:
+            width, height = img.size
+
+        # Detect which mode is available based on pipeline version
+        has_spotting = hasattr(vl_pipeline, 'pipeline_version') and \
+                       getattr(vl_pipeline, 'pipeline_version', None) == 'v1.5'
+
+        predict_kwargs = {
+            'use_layout_detection': False,
+            'use_queues': False,  # get direct exceptions, not wrapped RuntimeError
+        }
+        if has_spotting:
+            log.debug("Using spotting mode (native word-level boxes)")
+            predict_kwargs['prompt_label'] = 'spotting'
+        else:
+            log.debug("Using OCR mode (block-level boxes, word positions estimated)")
+            predict_kwargs['prompt_label'] = 'ocr'
+
+        result = vl_pipeline.predict(str(input_file), **predict_kwargs)
+
+        # Get language for hOCR
+        lang = PaddleOCREngine._get_paddle_lang(options)
+        lang_map_reverse = {v: k for k, v in PaddleOCREngine.LANGUAGE_MAP.items()}
+        hocr_lang = lang_map_reverse.get(lang, 'eng')
+
+        hocr_lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"',
+            '    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">',
+            '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">',
+            '<head>',
+            '<title></title>',
+            '<meta http-equiv="content-type" content="text/html; charset=utf-8" />',
+            '<meta name="ocr-system" content="PaddleOCR-VL via ocrmypdf-paddleocr" />',
+            '<meta name="ocr-capabilities" content="ocr_page ocr_carea ocr_par ocr_line ocrx_word" />',
+            '</head>',
+            '<body>',
+            f'<div class="ocr_page" id="page_1" title="bbox 0 0 {width} {height}">',
+        ]
+
+        all_text = []
+        word_id = 1
+        line_id = 1
+        carea_id = 1
+        par_id = 1
+
+        if result and len(result) > 0:
+            page_res = result[0]
+            spotting = page_res.get('spotting_res') if hasattr(page_res, 'get') else None
+
+            if spotting and spotting.get('rec_polys') and spotting.get('rec_texts'):
+                # ── Spotting path: native word-level polygon boxes ──────────────
+                rec_polys = spotting['rec_polys']
+                rec_texts = spotting['rec_texts']
+
+                word_boxes = [
+                    (txt, poly)
+                    for txt, poly in zip(rec_texts, rec_polys)
+                    if txt and txt.strip()
+                ]
+
+                lines = _group_words_into_lines(word_boxes)
+                log.debug(f"PaddleOCR-VL spotting: {len(word_boxes)} words, {len(lines)} lines")
+
+                for line_words in lines:
+                    if not line_words:
+                        continue
+
+                    all_x0, all_y0, all_x1, all_y1 = [], [], [], []
+                    for _txt, poly in line_words:
+                        wx0, wy0, wx1, wy1 = _poly_to_bbox(poly)
+                        all_x0.append(wx0); all_y0.append(wy0)
+                        all_x1.append(wx1); all_y1.append(wy1)
+
+                    lx0, ly0, lx1, ly1 = min(all_x0), min(all_y0), max(all_x1), max(all_y1)
+                    all_text.append(' '.join(t for t, _ in line_words))
+
+                    hocr_lines.append(
+                        f'<div class="ocr_carea" id="carea_{carea_id}" '
+                        f'title="bbox {lx0} {ly0} {lx1} {ly1}">'
+                    )
+                    hocr_lines.append(
+                        f'<p class="ocr_par" id="par_{par_id}" lang="{hocr_lang}" '
+                        f'title="bbox {lx0} {ly0} {lx1} {ly1}">'
+                    )
+                    hocr_lines.append(
+                        f'<span class="ocr_line" id="line_{line_id}" '
+                        f'title="bbox {lx0} {ly0} {lx1} {ly1}; baseline 0 0; x_wconf 95">'
+                    )
+                    for i, (word, poly) in enumerate(line_words):
+                        wx0, wy0, wx1, wy1 = _poly_to_bbox(poly)
+                        we = word.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        hocr_lines.append(
+                            f'<span class="ocrx_word" id="word_{word_id}" '
+                            f'title="bbox {wx0} {wy0} {wx1} {wy1}; x_wconf 95">{we}</span>'
+                        )
+                        if i < len(line_words) - 1:
+                            hocr_lines.append(' ')
+                        word_id += 1
+
+                    hocr_lines.extend(['</span>', '</p>', '</div>'])
+                    line_id += 1; carea_id += 1; par_id += 1
+
+            else:
+                # ── OCR/parsing_res_list path: block-level boxes ───────────────
+                parsing_res = page_res.get('parsing_res_list') \
+                    if hasattr(page_res, 'get') else []
+                if parsing_res is None:
+                    parsing_res = []
+
+                log.debug(f"PaddleOCR-VL ocr: {len(parsing_res)} blocks")
+
+                # Labels that carry readable text content
+                TEXT_LABELS = {
+                    'text', 'content', 'paragraph_title', 'doc_title',
+                    'abstract_title', 'reference_title', 'content_title',
+                    'table_title', 'figure_title', 'chart_title',
+                    'abstract', 'reference', 'reference_content',
+                    'algorithm', 'number', 'footnote', 'header', 'footer',
+                    'aside_text', 'vertical_text', 'vision_footnote', 'ocr',
+                }
+
+                for block in parsing_res:
+                    label = getattr(block, 'label', None) or block.get('block_label', '')
+                    content = getattr(block, 'content', None) or block.get('block_content', '')
+                    bbox = getattr(block, 'bbox', None) or block.get('block_bbox', None)
+
+                    if not content or not content.strip():
+                        continue
+                    if label not in TEXT_LABELS:
+                        continue
+                    if bbox is None or len(bbox) < 4:
+                        continue
+
+                    bx0, by0, bx1, by1 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+                    # Split block content into lines; estimate vertical position per line
+                    block_lines = [l for l in content.split('\n') if l.strip()]
+                    if not block_lines:
+                        continue
+
+                    block_h = max(by1 - by0, 1)
+                    line_h = block_h // len(block_lines)
+
+                    hocr_lines.append(
+                        f'<div class="ocr_carea" id="carea_{carea_id}" '
+                        f'title="bbox {bx0} {by0} {bx1} {by1}">'
+                    )
+                    hocr_lines.append(
+                        f'<p class="ocr_par" id="par_{par_id}" lang="{hocr_lang}" '
+                        f'title="bbox {bx0} {by0} {bx1} {by1}">'
+                    )
+
+                    for li, line_text in enumerate(block_lines):
+                        words = line_text.split()
+                        if not words:
+                            continue
+
+                        ly0_est = by0 + li * line_h
+                        ly1_est = min(by0 + (li + 1) * line_h, by1)
+                        all_text.append(line_text)
+
+                        hocr_lines.append(
+                            f'<span class="ocr_line" id="line_{line_id}" '
+                            f'title="bbox {bx0} {ly0_est} {bx1} {ly1_est}; '
+                            f'baseline 0 0; x_wconf 95">'
+                        )
+
+                        # Estimate word widths proportionally by character count
+                        line_w = bx1 - bx0
+                        total_chars = sum(len(w) for w in words)
+                        num_spaces = len(words) - 1
+                        if total_chars + num_spaces > 0:
+                            space_w = int((line_w * num_spaces) / (total_chars + num_spaces))
+                        else:
+                            space_w = 0
+                        word_area_w = line_w - space_w * num_spaces
+                        cur_x = bx0
+
+                        for wi, word in enumerate(words):
+                            if total_chars > 0:
+                                ww = int(word_area_w * len(word) / total_chars)
+                            else:
+                                ww = line_w // len(words)
+                            wx1_est = bx1 if wi == len(words) - 1 else cur_x + ww
+                            we = word.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            hocr_lines.append(
+                                f'<span class="ocrx_word" id="word_{word_id}" '
+                                f'title="bbox {cur_x} {ly0_est} {wx1_est} {ly1_est}; '
+                                f'x_wconf 95">{we}</span>'
+                            )
+                            if wi < len(words) - 1:
+                                hocr_lines.append(' ')
+                            cur_x = wx1_est + space_w
+                            word_id += 1
+
+                        hocr_lines.append('</span>')  # ocr_line
+                        line_id += 1
+
+                    hocr_lines.extend(['</p>', '</div>'])
+                    carea_id += 1; par_id += 1
+
+        hocr_lines.extend(['</div>', '</body>', '</html>'])
+
+        output_hocr.write_text('\n'.join(hocr_lines), encoding='utf-8')
+        output_text.write_text('\n'.join(all_text), encoding='utf-8')
+        log.debug(f"Generated hOCR (VL) with {line_id - 1} lines and {word_id - 1} words")
+
+    @staticmethod
+    def _generate_hocr_classic(input_file: Path, output_hocr: Path, output_text: Path, options):
+        """Generate hOCR output for an image using classic PaddleOCR pipeline."""
         log.debug(f"Running PaddleOCR on {input_file}")
 
         # Initialize PaddleOCR
