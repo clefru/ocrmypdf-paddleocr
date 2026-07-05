@@ -13,6 +13,90 @@ A PaddleOCR plugin for OCRmyPDF, enabling the use of PaddleOCR as an alternative
 
 ## Installation
 
+### ARM64
+
+Although `paddlepaddle` `aarch64` builds are available, you may still need to compile from source due to [incompatbility issues between hardware](https://github.com/PaddlePaddle/Paddle/issues/78616):
+
+<details>
+
+<summary>
+Docker
+</summary>
+
+```bash
+# (most of the instructions are Chinese-only, although I followed along with Google Translate version, it was clear enough)
+# https://www.paddlepaddle.org.cn/documentation/docs/en/install/compile/linux-compile-by-make.html#span-id-compile-from-host-span
+
+docker run -it ubuntu:24.04 /bin/bash
+
+apt update
+apt upgrade -y
+apt install -y bzip2 make
+apt install -y cmake gcc
+apt install -y python3-dev
+
+find `dirname $(dirname $(which python3))` -name "libpython3*.so"
+export PYTHON_LIBRARY=/usr/lib/python3.12/config-3.12-aarch64-linux-gnu/
+
+find `dirname $(dirname $(which python3))`/include -name "python3.12"
+
+# https://www.ecosia.org/ai-chat/2159e6c5bc2a1300433646a0af43f77ccabec4a5d946e5d2edbced5ea4468884
+# export PYTHON_INCLUDE_DIRS=/usr/include/aarch64-linux-gnu/python3.12/
+export PYTHON_INCLUDE_DIRS=/usr/include/python3.12/
+export PATH=/usr/bin/:$PATH
+
+apt install -y python3-virtualenvwrapper
+
+find / -name virtualenvwrapper.sh
+apt install -y nano
+nano /usr/share/virtualenvwrapper/virtualenvwrapper.sh
+
+mkdir $HOME/.virtualenvs
+echo "export WORKON_HOME=$HOME/.virtualenvs" >> ~/.bashrc
+echo "source /usr/share/virtualenvwrapper/virtualenvwrapper.sh" >> ~/.bashrc
+source ~/.bashrc
+workon
+
+export VIRTUALENVWRAPPER_PYTHON=/usr/bin/:$PATH
+
+mkvirtualenv paddle-venv
+workon paddle-venv
+
+# https://www.paddlepaddle.org.cn/documentation/docs/zh/install/Tables.html#third_party
+
+apt install -y patchelf
+apt install -y git
+
+git clone --recursive https://github.com/PaddlePaddle/Paddle.git
+cd Paddle
+
+git checkout develop
+mkdir build && cd build
+
+pip install -r ../python/requirements.txt
+pip install wheel
+
+# https://github.com/PaddlePaddle/Paddle/issues/78616#issuecomment-4221894029
+
+cmake .. -DPY_VERSION=3.12 -DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIRS} \
+-DPYTHON_LIBRARY=${PYTHON_LIBRARY} -DWITH_GPU=OFF -DWITH_ARM=ON -DTARGET_AARCH64=ON
+
+make -j$(nproc)
+```
+</details>
+If the build was successful you will end up with a `.whl` file inside `/Paddle/build/python/dist/`: you can then `docker cp running-container-id:/Paddle/build/python/dist/*.whl desired/location/on/device` (check the container id with `docker ps`). 
+
+After that create a virtual environment that matches the version you built (I built on Python `3.12`, which is why my wheel contains the string `cp312`, so I created an environment with `uv venv -p 3.12`). Then `source .venv/bin/activate` and `uv pip install -U paddlepaddle*.whl`: now you can `cd` to a local clone of this repo and continue installation as usual (`uv pip install .`).
+
+To make sure `paddlepaddle` is working properly before installing `ocrmypdf`, you can [test your installation with these steps from the PaddlePaddle docs](https://www.paddlepaddle.org.cn/documentation/docs/en/install/compile/linux-compile-by-make.html#yanzhenganzhuang):
+```bash
+python # enters a subshell into which you can execute Python code for testing
+import paddle
+paddle.utils.run_check()
+```
+
+After you exit your container, if you ever want to fire it up again, remember you can always run `docker start container-id-or-name` `docker exec -it container-id-or-name /bin/bash` (check container id with `docker ps -a` this time as the container isn't running).
+
 ### NixOS
 
 ```nix
