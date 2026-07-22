@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
+from concurrent.futures import Future
 from pathlib import Path
 
 from PIL import Image
@@ -21,6 +24,119 @@ except ImportError:
     PaddleOCRVL = None
 
 log = logging.getLogger(__name__)
+
+_BATCH_QUIET_PERIOD_SECONDS = 0.020
+_batch_service = None
+_batch_service_lock = threading.Lock()
+
+
+class _PaddleOCRBatchService:
+    """Own one PaddleOCR model and serialize batched prediction requests."""
+
+    def __init__(self, model, engine, batch_size):
+        self.model = model
+        self.engine = engine
+        self.batch_size = batch_size
+        self.requests = queue.Queue()
+        self.worker = threading.Thread(
+            target=self._run,
+            name='paddleocr-batch-coordinator',
+            daemon=True,
+        )
+        self.worker.start()
+
+    def predict(self, input_file):
+        future = Future()
+        self.requests.put((str(input_file), future))
+        return future.result()
+
+    def _run(self):
+        while True:
+            request = self.requests.get()
+            batch = [request]
+
+            # Keep collecting until the batch is full or no request arrives for
+            # one quiet period. Each arrival resets the 20 ms period.
+            while len(batch) < self.batch_size:
+                try:
+                    batch.append(
+                        self.requests.get(timeout=_BATCH_QUIET_PERIOD_SECONDS)
+                    )
+                except queue.Empty:
+                    break
+
+            paths = [path for path, _future in batch]
+            log.debug("Running PaddleOCR batch of %d page(s)", len(paths))
+            try:
+                if self.engine == 'vl':
+                    has_spotting = (
+                        getattr(self.model, 'pipeline_version', None) == 'v1.5'
+                    )
+                    predict_kwargs = {
+                        'use_layout_detection': False,
+                        'use_queues': False,
+                        'prompt_label': 'spotting' if has_spotting else 'ocr',
+                    }
+                else:
+                    predict_kwargs = {'return_word_box': True}
+
+                results = list(self.model.predict(paths, **predict_kwargs))
+                if len(results) != len(batch):
+                    raise RuntimeError(
+                        "PaddleOCR returned "
+                        f"{len(results)} results for a batch of {len(batch)} pages"
+                    )
+            except BaseException as exc:
+                for _path, future in batch:
+                    future.set_exception(exc)
+            else:
+                for (_path, future), result in zip(batch, results):
+                    # Existing per-page conversion expects PaddleOCR's outer list.
+                    future.set_result([result])
+
+
+def _batch_configuration(options):
+    engine = getattr(options, 'paddle_engine', 'classic')
+    batch_size = getattr(options, 'paddle_batch_size', None)
+    if batch_size is None:
+        from ocrmypdf.helpers import available_cpu_count
+        batch_size = max(1, (getattr(options, 'jobs', None) or available_cpu_count()) // 2)
+
+    model_key = (
+        engine,
+        PaddleOCREngine._get_paddle_lang(options),
+        bool(getattr(options, 'paddle_use_gpu', False)),
+        getattr(options, 'paddle_det_model_dir', None),
+        getattr(options, 'paddle_rec_model_dir', None),
+        getattr(options, 'paddle_cls_model_dir', None),
+    )
+    return model_key, batch_size
+
+
+def _get_batch_service(options):
+    """Return the process-wide batch service, creating its model once."""
+    global _batch_service
+    model_key, batch_size = _batch_configuration(options)
+    with _batch_service_lock:
+        if _batch_service is None:
+            engine = model_key[0]
+            if engine == 'vl':
+                model = PaddleOCREngine._get_paddle_vl(options)
+            else:
+                model = PaddleOCREngine._get_paddle_ocr(options)
+            _batch_service = _PaddleOCRBatchService(model, engine, batch_size)
+            _batch_service.model_key = model_key
+        elif _batch_service.model_key != model_key:
+            raise RuntimeError(
+                "The PaddleOCR singleton is already configured differently. "
+                "Use one engine, language, device, and model configuration per process."
+            )
+        elif _batch_service.batch_size != batch_size:
+            raise RuntimeError(
+                "The PaddleOCR singleton is already configured with a different "
+                "batch size."
+            )
+        return _batch_service
 
 
 @hookimpl
@@ -58,6 +174,12 @@ def add_options(parser):
         help='Show PaddleOCR internal logging',
     )
     paddle.add_argument(
+        '--paddle-batch-size',
+        type=int,
+        metavar='N',
+        help='Maximum pages per PaddleOCR batch (default: --jobs)',
+    )
+    paddle.add_argument(
         '--paddle-det-model-dir',
         metavar='DIR',
         help='Path to text detection model directory',
@@ -77,6 +199,17 @@ def add_options(parser):
 @hookimpl
 def check_options(options):
     """Validate PaddleOCR options."""
+    from ocrmypdf.exceptions import BadArgsError
+
+    if not getattr(options, 'use_threads', True):
+        raise BadArgsError(
+            "The PaddleOCR plugin requires thread-based jobs; "
+            "remove --no-use-threads."
+        )
+    batch_size = getattr(options, 'paddle_batch_size', None)
+    if batch_size is not None and batch_size < 1:
+        raise BadArgsError("--paddle-batch-size must be at least 1")
+
     engine = getattr(options, 'paddle_engine', 'classic')
     if engine == 'vl':
         if PaddleOCRVL is None:
@@ -337,27 +470,10 @@ class PaddleOCREngine(OcrEngine):
         """
         log.debug(f"Running PaddleOCR-VL on {input_file}")
 
-        vl_pipeline = PaddleOCREngine._get_paddle_vl(options)
-
         with Image.open(input_file) as img:
             width, height = img.size
 
-        # Detect which mode is available based on pipeline version
-        has_spotting = hasattr(vl_pipeline, 'pipeline_version') and \
-                       getattr(vl_pipeline, 'pipeline_version', None) == 'v1.5'
-
-        predict_kwargs = {
-            'use_layout_detection': False,
-            'use_queues': False,  # get direct exceptions, not wrapped RuntimeError
-        }
-        if has_spotting:
-            log.debug("Using spotting mode (native word-level boxes)")
-            predict_kwargs['prompt_label'] = 'spotting'
-        else:
-            log.debug("Using OCR mode (block-level boxes, word positions estimated)")
-            predict_kwargs['prompt_label'] = 'ocr'
-
-        result = vl_pipeline.predict(str(input_file), **predict_kwargs)
+        result = _get_batch_service(options).predict(input_file)
 
         # Get language for hOCR
         lang = PaddleOCREngine._get_paddle_lang(options)
@@ -552,9 +668,6 @@ class PaddleOCREngine(OcrEngine):
         """Generate hOCR output for an image using classic PaddleOCR pipeline."""
         log.debug(f"Running PaddleOCR on {input_file}")
 
-        # Initialize PaddleOCR
-        paddle_ocr = PaddleOCREngine._get_paddle_ocr(options)
-
         # Get image dimensions and DPI info
         with Image.open(input_file) as img:
             width, height = img.size
@@ -563,7 +676,7 @@ class PaddleOCREngine(OcrEngine):
 
         # Run OCR - use predict() instead of deprecated ocr()
         # Enable return_word_box=True for native word-level bounding boxes
-        result = paddle_ocr.predict(str(input_file), return_word_box=True)
+        result = _get_batch_service(options).predict(input_file)
 
         # Calculate scaling factors from preprocessed image
         scale_x = 1.0

@@ -105,6 +105,7 @@ The plugin adds the following PaddleOCR-specific options:
 - `--paddle-use-gpu`: Use GPU acceleration (requires GPU-enabled PaddlePaddle)
 - `--paddle-no-angle-cls`: Disable text orientation classification
 - `--paddle-show-log`: Show PaddleOCR internal logging
+- `--paddle-batch-size N`: Maximum pages per PaddleOCR batch (defaults to `max(jobs // 2, 1)`)
 - `--paddle-det-model-dir DIR`: Path to custom text detection model directory
 - `--paddle-rec-model-dir DIR`: Path to custom text recognition model directory
 - `--paddle-cls-model-dir DIR`: Path to custom text orientation classification model directory
@@ -195,6 +196,11 @@ The plugin implements the OCRmyPDF `OcrEngine` interface, which requires:
 
 PaddleOCR processes each page image and returns bounding boxes with recognized text and confidence scores. The plugin converts this to hOCR (HTML-based OCR) format, which OCRmyPDF uses to create a searchable PDF.
 
+When multiple OCRmyPDF jobs are used, the plugin shares one PaddleOCR model across
+the worker threads. Requests are collected into batches up to
+`--paddle-batch-size`; a partial batch starts after no new page arrives for 20 ms.
+Process-based jobs (`--no-use-threads`) are not supported.
+
 ## Bounding Box Accuracy
 
 This plugin includes optimized bounding box calculation for accurate text selection in the output PDF:
@@ -202,6 +208,7 @@ This plugin includes optimized bounding box calculation for accurate text select
 ### Native Word-Level Boxes (PaddleOCR 3.x)
 
 The plugin uses PaddleOCR 3.x's native `return_word_box=True` parameter to get accurate word-level bounding boxes directly from the OCR engine:
+
 - Native word boxes provide precise boundaries for each word
 - Automatic merging of split tokens (handles German umlauts, punctuation, etc.)
 - Falls back to estimation algorithm when word boxes aren't available (e.g., blank pages)
@@ -211,6 +218,7 @@ The plugin uses PaddleOCR 3.x's native `return_word_box=True` parameter to get a
 ### Polygon-Based Vertical Bounds
 
 Instead of using simple min/max coordinates, the plugin uses PaddleOCR's 4-point polygon geometry:
+
 - For horizontal text, points 0-1 define the top edge and points 2-3 define the bottom edge
 - Averaging these edge points provides tighter vertical bounds
 - Falls back to min/max for non-standard polygon shapes
