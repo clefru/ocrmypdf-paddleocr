@@ -169,22 +169,57 @@ class PaddleOCREngine(OcrEngine):
 
     # Mapping from Tesseract/OCRmyPDF language codes to PaddleOCR codes
     LANGUAGE_MAP = {
-        'eng': 'en',
-        'chi_sim': 'ch',
-        'chi_tra': 'chinese_cht',
-        'fra': 'fr',
-        'deu': 'german',
-        'jpn': 'japan',
-        'kor': 'korean',
-        'spa': 'spanish',
-        'rus': 'ru',
-        'ara': 'ar',
-        'hin': 'hi',
-        'por': 'pt',
-        'ita': 'it',
-        'tur': 'tr',
-        'vie': 'vi',
-        'tha': 'th',
+        'eng': 'en',              # English
+        'chi_sim': 'ch',          # Simplified Chinese
+        'chi_tra': 'chinese_cht', # Traditional Chinese
+        'fra': 'fr',              # French
+        'deu': 'german',          # German
+        'jpn': 'japan',           # Japanese
+        'kor': 'korean',          # Korean
+        'spa': 'spanish',         # Spanish
+        'rus': 'ru',              # Russian
+        'ara': 'ar',              # Arabic
+        'hin': 'hi',              # Hindi
+        'por': 'pt',              # Portuguese
+        'ita': 'it',              # Italian
+        'tur': 'tr',              # Turkish
+        'vie': 'vi',              # Vietnamese
+        'tha': 'th',              # Thai
+        'urd': 'ur',              # Urdu
+        'mar': 'mr',              # Marathi
+        'tam': 'ta',              # Tamil
+        'tel': 'tl',              # Telugu
+        'kan': 'ka',              # Kannada
+        'fas': 'fa',              # Persian
+        'nld': 'nl',              # Dutch
+        'pol': 'pl',              # Polish
+        'ron': 'ro',              # Romanian
+        'swe': 'sv',              # Swedish
+        'ind': 'id',              # Indonesian
+        'ces': 'cs',              # Czech
+        'hun': 'hu',              # Hungarian
+        'ell': 'el',              # Greek
+        'bul': 'bg',              # Bulgarian
+        'ukr': 'uk',              # Ukrainian
+        'hrv': 'hr',              # Croatian
+        'fin': 'fi',              # Finnish
+        'dan': 'da',              # Danish
+        'nob': 'no',              # Norwegian
+        'slk': 'sk',              # Slovak
+        'slv': 'sl',              # Slovenian
+        'ron': 'ro',              # Romanian
+        'est': 'et',              # Estonian
+        'lav': 'lv',              # Latvian
+        'lit': 'lt',              # Lithuanian
+        'sqi': 'sq',              # Albanian
+        'srp': 'rs_latin',        # Serbian
+        'aze': 'az',              # Azerbaijani
+        'msa': 'ms',              # Malay
+        'swh': 'sw',              # Swahili
+        'tgl': 'tl',              # Tagalog
+        'uzb': 'uz',              # Uzbek
+        'mon': 'mn',              # Mongolian
+        'nep': 'ne',              # Nepali
     }
 
     @staticmethod
@@ -213,9 +248,11 @@ class PaddleOCREngine(OcrEngine):
         """Return the set of all languages supported by PaddleOCR."""
         # PaddleOCR supports many languages - return a comprehensive list
         return {
-            'en', 'ch', 'chinese_cht', 'ta', 'te', 'ka', 'latin', 'ar', 'cy', 'da',
-            'de', 'es', 'et', 'fr', 'ga', 'hi', 'it', 'ja', 'ko', 'la', 'nl', 'no',
-            'oc', 'pt', 'ro', 'ru', 'sr', 'sv', 'tr', 'uk', 'vi',
+            'ar',  'az',  'bg',  'ch',  'chinese_cht',  'cs',  'da',  'el',  'en',  
+            'et',  'fa',  'fi',  'fr',  'german',  'hi',  'hr',  'hu',  'id',  'it',
+            'japan',  'ka',  'korean',  'lt',  'lv',  'mn',  'mr',  'ms',  'ne',  'nl',
+            'no',  'pl',  'pt',  'ro',  'rs_latin',  'ru',  'sk',  'sl',  'spanish',  'sq',
+            'sv',  'sw',  'ta',  'th',  'tl',  'tr',  'uk',  'ur',  'uz',  'vi',
             # Also include common Tesseract codes for compatibility
             'eng', 'chi_sim', 'chi_tra', 'deu', 'fra', 'spa', 'rus', 'jpn', 'kor'
         }
@@ -253,6 +290,7 @@ class PaddleOCREngine(OcrEngine):
             'use_doc_unwarping': False,
             # Disable orientation classification - OCRmyPDF handles page rotation
             'use_doc_orientation_classify': False,
+            'enable_mkldnn' : False,
         }
 
         # Set device for GPU/CPU
